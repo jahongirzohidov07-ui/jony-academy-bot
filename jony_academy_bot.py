@@ -3,6 +3,7 @@ import sqlite3
 import csv
 import io
 import re
+import html
 import logging
 from datetime import datetime
 from datetime import time as dt_time
@@ -36,8 +37,7 @@ NAME, PHONE, CLASS_GRADE, COURSE, BRANCH, CONFIRM = range(6)
 BROADCAST_MSG = 10  # alohida range — reg_conv bilan toʼqnashmaydi
 
 
-# ─ DB ────────────────────────────────────────────────────────────────────────────
-
+# ─── DB ────────────────────────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -57,6 +57,7 @@ def init_db():
             group_message_id INTEGER
         )
     """)
+    # Mavjud DB uchun migration
     for col_def in [
         "status TEXT DEFAULT 'pending'",
         "updated_at TEXT",
@@ -70,8 +71,6 @@ def init_db():
     conn.close()
 
 
-# ─ Telefon validatsiya ────────────────────────────────────────────────────────────────────────
-
 def validate_phone(phone: str) -> bool:
     p = phone.strip().replace(" ", "").replace("-", "")
     return bool(re.match(r'^(\+998|998|0)[0-9]{9}$|^[0-9]{9}$', p))
@@ -79,14 +78,10 @@ def validate_phone(phone: str) -> bool:
 
 def normalize_phone(phone: str) -> str:
     p = phone.strip().replace(" ", "").replace("-", "")
-    if p.startswith("+998"):
-        return p
-    if p.startswith("998"):
-        return "+" + p
-    if p.startswith("0") and len(p) == 10:
-        return "+998" + p[1:]
-    if len(p) == 9:
-        return "+998" + p
+    if p.startswith("+998"):    return p
+    if p.startswith("998"):     return "+" + p
+    if p.startswith("0") and len(p) == 10: return "+998" + p[1:]
+    if len(p) == 9:             return "+998" + p
     return phone
 
 
@@ -95,19 +90,18 @@ def phone_exists(phone: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id FROM registrations WHERE phone = ?", (normalized,))
-    result = c.fetchone()
+    row = c.fetchone()
     conn.close()
-    return result is not None
+    return row is not None
 
 
-# ─ Roʼyxatdan oʼtish oqimi ─────────────────────────────────────────────────────────────────────
-
+# ─── Conversation handlers ───────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text(
-        "👋 Salom! *Jony Academy* ga xush kelibsiz!\n\n"
-        "Roʼyxatdan oʼтish uchun *toʼliq ismingizni* kiriting:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        "🎓 *Jony Academy*ga xush kelibsiz!\n\n"
+        "Roʼyxatdan oʼtish uchun ismingizni kiriting:",
+        parse_mode="Markdown"
     )
     return NAME
 
@@ -115,38 +109,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
     await update.message.reply_text(
-        "📱 *Telefon raqamingizni* kiriting:\n"
-        "Masalan: +998901234567 yoki 901234567",
-        parse_mode="Markdown"
+        "📱 Telefon raqamingizni kiriting:\n"
+        "(Masalan: +998901234567)",
+        reply_markup=ReplyKeyboardRemove()
     )
     return PHONE
 
 
 async def ask_grade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
-
     if not validate_phone(phone):
         await update.message.reply_text(
-            "❌ Telefon raqam notoʼgʼri formatda!\n\n"
-            "Toʼgʼri format: +998901234567 yoki 901234567\n"
+            "❌ Telefon raqam notoʻgʻri formatda!\n\n"
+            "Toʻgʻri format: +998901234567\n"
             "Qaytadan kiriting:"
         )
         return PHONE
-
     normalized = normalize_phone(phone)
-
-    if phone_exists(phone):
+    if phone_exists(normalized):
         await update.message.reply_text(
-            "⚠️ Bu telefon raqam allaqachon roʼyxatdan oʼтgan!\n"
-            "Agar muammo boʼлsa, adminimizga murojaat qiling: @jony_academy"
+            "⚠️ Bu telefon raqam allaqachon roʼyxatdan oʼgan!\n\n"
+            "Savollar boʼsa: @jony_academy"
         )
         return ConversationHandler.END
-
     context.user_data["phone"] = normalized
     await update.message.reply_text(
-        "🎒 *Yoshingiz yoki nechanchi sinfda* oʼqishingizni kiriting:\n"
-        "Masalan: 14 yosh, 7-sinf",
-        parse_mode="Markdown"
+        "🎒 Yoshingiz yoki nechanchi sinfda oʼqishingizni kiriting:\n"
+        "(Masalan: 14 yosh, 7-sinf)"
     )
     return CLASS_GRADE
 
@@ -182,16 +171,16 @@ async def ask_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["branch"] = query.data.split(":", 1)[1]
     d = context.user_data
     summary = (
-        f"📋 *Maʼlumotlaringizni tekshiring:*\n\n"
-        f"👤 Ism: {d['name']}\n"
-        f"📱 Telefon: {d['phone']}\n"
-        f"🎒 Yosh/sinf: {d['grade']}\n"
-        f"📚 Kurs: {d['course']}\n"
-        f"📍 Filial: {d['branch']}"
+        f"📋 <b>Ma'lumotlaringizni tekshiring:</b>\n\n"
+        f"👤 Ism: {html.escape(d['name'])}\n"
+        f"📱 Telefon: {html.escape(d['phone'])}\n"
+        f"🎒 Yosh/sinf: {html.escape(d['grade'])}\n"
+        f"📚 Kurs: {html.escape(d['course'])}\n"
+        f"📍 Filial: {html.escape(d['branch'])}"
     )
-    await query.edit_message_text(summary, parse_mode="Markdown")
+    await query.edit_message_text(summary, parse_mode="HTML")
     await query.message.reply_text(
-        "Yuqoridagi maʼlumotlar toʼgʼrimi?",
+        "Yuqoridagi ma'lumotlar toʻgʻrime?",
         reply_markup=ReplyKeyboardMarkup(
             [["✅ Tasdiqlash", "❌ Bekor qilish"]],
             resize_keyboard=True, one_time_keyboard=True
@@ -218,39 +207,41 @@ async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.commit()
     conn.close()
 
+    # Foydalanuvchiga tasdiqlash xabari
     await update.message.reply_text(
-        "🎉 *Murojaatingiz muvaffaqiyatli qabul qilindi!*\n\n"
-        f"📍 *{d['branch']}* filialimiz xodimlari tez orada siz bilan bogʼlanishadi.\n\n"
-        "Savollar boʼлsa: @jony_academy\n"
-        "Koʼrishguncha! 👋",
-        parse_mode="Markdown",
+        f"🎉 <b>Murojaatingiz muvaffaqiyatli qabul qilindi!</b>\n\n"
+        f"📍 <b>{html.escape(d['branch'])}</b> filialimiz xodimlari tez orada siz bilan bogʼlanišadi.\n\n"
+        "Savollar boʼsa: @jony_academy\n"
+        "Koʼrišguncha! 👋",
+        parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
 
+    # Sotuv guruhiga xabar + inline holat tugmalari
     if SALES_GROUP_ID:
         uname = f"@{user.username}" if user.username else "—"
         dt_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         msg = (
-            f"🔔 *YANGI MUROJAAT — Jony Academy*\n"
+            f"🔔 <b>YANGI MUROJAAT — Jony Academy</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 *Ism:* {d['name']}\n"
-            f"📱 *Telefon:* `{d['phone']}`\n"
-            f"🎒 *Yosh/sinf:* {d['grade']}\n"
-            f"📚 *Kurs:* {d['course']}\n"
-            f"📍 *Filial:* {d['branch']}\n"
-            f"💬 *Telegram:* {uname}\n"
-            f"🕐 *Vaqt:* {dt_str}\n"
+            f"👤 <b>Ism:</b> {html.escape(d['name'])}\n"
+            f"📱 <b>Telefon:</b> <code>{html.escape(d['phone'])}</code>\n"
+            f"🎒 <b>Yosh/sinf:</b> {html.escape(d['grade'])}\n"
+            f"📚 <b>Kurs:</b> {html.escape(d['course'])}\n"
+            f"📍 <b>Filial:</b> {html.escape(d['branch'])}\n"
+            f"💬 <b>Telegram:</b> {html.escape(uname)}\n"
+            f"🕐 <b>Vaqt:</b> {dt_str}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📞 Qoʼngʼiroq qilindi", callback_data=f"status:{reg_id}:called"),
+                InlineKeyboardButton("\ud83d\udcde Qoʻngʻiroq qilindi", callback_data=f"status:{reg_id}:called"),
                 InlineKeyboardButton("✅ Keldi",               callback_data=f"status:{reg_id}:came"),
             ],
             [InlineKeyboardButton("❌ Kelmadi", callback_data=f"status:{reg_id}:not_came")],
         ])
         sent = await context.bot.send_message(
-            chat_id=SALES_GROUP_ID, text=msg, parse_mode="Markdown", reply_markup=kb
+            chat_id=SALES_GROUP_ID, text=msg, parse_mode="HTML", reply_markup=kb
         )
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -271,7 +262,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ─ Sotuv guruh: holat tugmalari ─────────────────────────────────────────────────────────────────────────
+# ─── Sotuv guruh: holat tugmalari ────────────────────────────────────────────────────
 
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -284,7 +275,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reg_id = int(reg_id_str)
 
     labels = {
-        "called":   "📞 Qoʼngʼiroq qilindi",
+        "called":   "📞 Qoʻngʻiroq qilindi",
         "came":     "✅ Keldi",
         "not_came": "❌ Kelmadi",
     }
@@ -301,26 +292,27 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer(f"✅ {label}")
 
+    # Tugmalarni olib tashlaymiz
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
 
+    # Asl xabarga reply sifatida holat
     manager = query.from_user.full_name
     name = row[0] if row else "—"
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text=(
-            f"🔄 *{name}* — {label}\n"
-            f"👤 {manager} · 🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+            f"🔄 <b>{html.escape(name)}</b> — {html.escape(label)}\n"
+            f"👤 {html.escape(manager)} · 🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
         ),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_to_message_id=query.message.message_id
     )
 
 
-# ─ Broadcast ─────────────────────────────────────────────────────────────────────────────
-
+# ─── Broadcast ────────────────────────────────────────────────────────────────────────────
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_IDS:
         await update.message.reply_text(
@@ -336,7 +328,7 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "📢 *Broadcast rejimi*\n\n"
-        "Barcha roʼyxatdan oʼтgan foydalanuvchilarga "
+        "Barcha roʼyxatdan oʼgan foydalanuvchilarga "
         "yuboriladigan xabarni yozing.\n\n"
         "Bekor qilish: /cancel",
         parse_mode="Markdown"
@@ -360,8 +352,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=f"📢 *Jony Academy:*\n\n{text}",
-                parse_mode="Markdown"
+                text=f"📢 Jony Academy:\n\n{text}",
             )
             sent += 1
         except Exception:
@@ -376,8 +367,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ─ Admin buyruqlari ───────────────────────────────────────────────────────────────────────────
-
+# ─── Admin buyruqlari ───────────────────────────────────────────────────────────────────────────
 async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -397,7 +387,7 @@ async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Jami: *{total}*\n\n"
         f"📈 *Holat:*\n"
         f"  ⏳ Kutilmoqda: {status_d.get('pending', 0)}\n"
-        f"  📞 Qoʼngʼiroq: {status_d.get('called', 0)}\n"
+        f"  📞 Qoʻngʻiroq: {status_d.get('called', 0)}\n"
         f"  ✅ Keldi: {status_d.get('came', 0)}\n"
         f"  ❌ Kelmadi: {status_d.get('not_came', 0)}\n\n"
         f"📚 *Kurslar:*\n" +
@@ -436,8 +426,7 @@ async def royxat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─ Kunlik hisobot (job) ───────────────────────────────────────────────────────────────────────
-
+# ─── Kunlik hisobot (job) ────────────────────────────────────────────────────────────────────
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     if not SALES_GROUP_ID:
         return
@@ -482,7 +471,7 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
         f"📥 Bugun: *{today_total}* ta murojaat\n\n"
         f"*Holat:*\n"
         f"  ⏳ Kutilmoqda: {s.get('pending', 0)}\n"
-        f"  📞 Qoʼngʼiroq qilindi: {s.get('called', 0)}\n"
+        f"  📞 Qoʻngʻiroq qilindi: {s.get('called', 0)}\n"
         f"  ✅ Keldi: {s.get('came', 0)}\n"
         f"  ❌ Kelmadi: {s.get('not_came', 0)}\n\n"
         f"*Kurslar:*\n" +
@@ -497,8 +486,7 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─ Main ─────────────────────────────────────────────────────────────────────────────
-
+# ─── Main ──────────────────────────────────────────────────────────────────────────────────
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
@@ -533,6 +521,7 @@ def main():
     app.add_handler(CommandHandler("stat",     stat_command))
     app.add_handler(CommandHandler("royxat",   royxat_command))
 
+    # Har kuni soat 20:00 Toshkent vaqtida kunlik hisobot
     app.job_queue.run_daily(
         daily_report,
         time=dt_time(20, 0, tzinfo=ZoneInfo("Asia/Tashkent"))
