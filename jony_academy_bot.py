@@ -1,392 +1,546 @@
-"""
-============================================================
-    Jony Academy — RO'YXATDAN O'TISH BOTI
-============================================================
-Sozlash uchun quyidagilarni to'ldiring:
-    BOT_TOKEN        — @BotFather dan olingan token
-    SALES_GROUP_ID   — Sotuv menejerlar guruhi ID
-"""
-
-import logging
-import sqlite3
 import os
-import datetime
+import sqlite3
+import csv
+import io
+import re
+import logging
+from datetime import datetime
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    filters, ContextTypes, CallbackQueryHandler
 )
 
-# ──────────────────────────────────────────────
-# SOZLAMALAR
-# ──────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN      = os.environ.get("ACADEMY_BOT_TOKEN", "")
 SALES_GROUP_ID = int(os.environ.get("ACADEMY_SALES_GROUP_ID", "0"))
+ADMIN_IDS_RAW  = os.environ.get("ACADEMY_ADMIN_IDS", "")
+ADMIN_IDS      = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().lstrip("-").isdigit()]
 DB_PATH        = os.environ.get("ACADEMY_DB_PATH", "academy.db")
 
 KURSLAR   = ["Ingliz tili", "Rus tili", "Turk tili", "Nemis tili"]
 FILIALLAR = ["Zafar", "Bekobod Shahar", "Stretinko"]
 
-# ConversationHandler holatlari
 NAME, PHONE, CLASS_GRADE, COURSE, BRANCH, CONFIRM = range(6)
+BROADCAST_MSG = 10  # alohida range — reg_conv bilan toʼqnashmaydi
 
-# ──────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
 
-# ──────────────────────────────────────────────
-# DATABASE
-# ──────────────────────────────────────────────
-def db_init():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS applications (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            name        TEXT,
-            phone       TEXT,
-            grade       TEXT,
-            course      TEXT,
-            branch      TEXT,
-            created_at  TEXT
+# ─ DB ────────────────────────────────────────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS registrations (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          INTEGER,
+            username         TEXT,
+            name             TEXT,
+            phone            TEXT,
+            grade            TEXT,
+            course           TEXT,
+            branch           TEXT,
+            status           TEXT DEFAULT 'pending',
+            created_at       TEXT,
+            updated_at       TEXT,
+            group_message_id INTEGER
         )
     """)
-    con.commit()
-    con.close()
+    for col_def in [
+        "status TEXT DEFAULT 'pending'",
+        "updated_at TEXT",
+        "group_message_id INTEGER",
+    ]:
+        try:
+            c.execute(f"ALTER TABLE registrations ADD COLUMN {col_def}")
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
 
-def db_save(user_id, name, phone, grade, course, branch):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO applications (user_id,name,phone,grade,course,branch,created_at) VALUES (?,?,?,?,?,?,?)",
-        (user_id, name, phone, grade, course, branch, datetime.datetime.now().isoformat())
-    )
-    con.commit()
-    con.close()
 
-def db_count():
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT COUNT(*) FROM applications").fetchone()
-    con.close()
-    return row[0] if row else 0
+# ─ Telefon validatsiya ────────────────────────────────────────────────────────────────────────
 
-def db_all():
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        "SELECT name, phone, grade, course, branch, created_at FROM applications ORDER BY id DESC"
-    ).fetchall()
-    con.close()
-    return rows
+def validate_phone(phone: str) -> bool:
+    p = phone.strip().replace(" ", "").replace("-", "")
+    return bool(re.match(r'^(\+998|998|0)[0-9]{9}$|^[0-9]{9}$', p))
 
-# ──────────────────────────────────────────────
-# /start
-# ──────────────────────────────────────────────
+
+def normalize_phone(phone: str) -> str:
+    p = phone.strip().replace(" ", "").replace("-", "")
+    if p.startswith("+998"):
+        return p
+    if p.startswith("998"):
+        return "+" + p
+    if p.startswith("0") and len(p) == 10:
+        return "+998" + p[1:]
+    if len(p) == 9:
+        return "+998" + p
+    return phone
+
+
+def phone_exists(phone: str) -> bool:
+    normalized = normalize_phone(phone)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM registrations WHERE phone = ?", (normalized,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+
+# ─ Roʼyxatdan oʼtish oqimi ─────────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎓 *Jony Academy*'ga xush kelibsiz!\n\n"
-        "Bu bot orqali kursimizga ro'yxatdan o'tishingiz mumkin.\n\n"
-        "📝 Ro'yxatdan o'tish uchun bir necha savollarga javob bering.\n\n"
-        "Ismingizni kiriting (to'liq ism-familya):",
+        "👋 Salom! *Jony Academy* ga xush kelibsiz!\n\n"
+        "Roʼyxatdan oʼтish uchun *toʼliq ismingizni* kiriting:",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=ReplyKeyboardRemove()
     )
     return NAME
 
-# ──────────────────────────────────────────────
-# ISM
-# ──────────────────────────────────────────────
+
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if len(name) < 3:
-        await update.message.reply_text("❗ Iltimos, to'liq ism-familyangizni kiriting:")
-        return NAME
-
-    context.user_data["name"] = name
-
-    phone_kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("📞 Telefon raqamni yuborish", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    context.user_data["name"] = update.message.text.strip()
     await update.message.reply_text(
-        f"✅ *{name}*\n\n"
-        "📱 Endi telefon raqamingizni yuboring:",
-        parse_mode="Markdown",
-        reply_markup=phone_kb,
+        "📱 *Telefon raqamingizni* kiriting:\n"
+        "Masalan: +998901234567 yoki 901234567",
+        parse_mode="Markdown"
     )
     return PHONE
 
-# ──────────────────────────────────────────────
-# TELEFON
-# ──────────────────────────────────────────────
+
 async def ask_grade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.contact:
-        phone = update.message.contact.phone_number
-        if not phone.startswith("+"):
-            phone = "+" + phone
-    else:
-        phone = update.message.text.strip()
+    phone = update.message.text.strip()
 
-    context.user_data["phone"] = phone
+    if not validate_phone(phone):
+        await update.message.reply_text(
+            "❌ Telefon raqam notoʼgʼri formatda!\n\n"
+            "Toʼgʼri format: +998901234567 yoki 901234567\n"
+            "Qaytadan kiriting:"
+        )
+        return PHONE
 
+    normalized = normalize_phone(phone)
+
+    if phone_exists(phone):
+        await update.message.reply_text(
+            "⚠️ Bu telefon raqam allaqachon roʼyxatdan oʼтgan!\n"
+            "Agar muammo boʼлsa, adminimizga murojaat qiling: @jony_academy"
+        )
+        return ConversationHandler.END
+
+    context.user_data["phone"] = normalized
     await update.message.reply_text(
-        "✅ Telefon saqlandi!\n\n"
-        "🎒 Yoshingiz yoki sinfingizni kiriting:\n"
-        "_(masalan: 15 yosh, 9-sinf, talaba va h.k.)_",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
+        "🎒 *Yoshingiz yoki nechanchi sinfda* oʼqishingizni kiriting:\n"
+        "Masalan: 14 yosh, 7-sinf",
+        parse_mode="Markdown"
     )
     return CLASS_GRADE
 
-# ──────────────────────────────────────────────
-# SINF/YOSH
-# ──────────────────────────────────────────────
+
 async def ask_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    grade = update.message.text.strip()
-    if len(grade) < 1:
-        await update.message.reply_text("❗ Iltimos, yosh yoki sinfingizni kiriting:")
-        return CLASS_GRADE
-
-    context.user_data["grade"] = grade
-
-    # Kurslar inline keyboard
-    buttons = [[InlineKeyboardButton(k, callback_data=f"course:{k}")] for k in KURSLAR]
+    context.user_data["grade"] = update.message.text.strip()
+    keyboard = [[InlineKeyboardButton(k, callback_data=f"course:{k}")] for k in KURSLAR]
     await update.message.reply_text(
-        "📚 Qaysi kursga qiziqasiz?",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "📚 Qaysi *kursga* yozilmoqchisiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return COURSE
 
-# ──────────────────────────────────────────────
-# KURS (inline callback)
-# ──────────────────────────────────────────────
+
 async def ask_branch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    course = query.data.replace("course:", "")
-    context.user_data["course"] = course
-
-    await query.edit_message_text(f"✅ Kurs: *{course}*", parse_mode="Markdown")
-
-    # Filiallar inline keyboard
-    buttons = [[InlineKeyboardButton(f, callback_data=f"branch:{f}")] for f in FILIALLAR]
-    await query.message.reply_text(
-        "📍 Qaysi filialga kelishingiz qulay?",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    context.user_data["course"] = query.data.split(":", 1)[1]
+    keyboard = [[InlineKeyboardButton(f, callback_data=f"branch:{f}")] for f in FILIALLAR]
+    await query.edit_message_text(
+        f"✅ Kurs tanlandi: *{context.user_data['course']}*\n\n"
+        "📍 Qaysi *filialga* borishni xohlaysiz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return BRANCH
 
-# ──────────────────────────────────────────────
-# FILIAL (inline callback)
-# ──────────────────────────────────────────────
+
 async def ask_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    branch = query.data.replace("branch:", "")
-    context.user_data["branch"] = branch
-
-    await query.edit_message_text(f"✅ Filial: *{branch}*", parse_mode="Markdown")
-
+    context.user_data["branch"] = query.data.split(":", 1)[1]
     d = context.user_data
-    confirm_kb = ReplyKeyboardMarkup(
-        [["✅ Tasdiqlash", "❌ Bekor qilish"]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
+    summary = (
+        f"📋 *Maʼlumotlaringizni tekshiring:*\n\n"
+        f"👤 Ism: {d['name']}\n"
+        f"📱 Telefon: {d['phone']}\n"
+        f"🎒 Yosh/sinf: {d['grade']}\n"
+        f"📚 Kurs: {d['course']}\n"
+        f"📍 Filial: {d['branch']}"
     )
+    await query.edit_message_text(summary, parse_mode="Markdown")
     await query.message.reply_text(
-        "📋 *Ma'lumotlaringizni tekshiring:*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 *Ism:* {d['name']}\n"
-        f"📱 *Telefon:* {d['phone']}\n"
-        f"🎒 *Yosh/sinf:* {d['grade']}\n"
-        f"📚 *Kurs:* {d['course']}\n"
-        f"📍 *Filial:* {d['branch']}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Ma'lumotlar to'g'rimi?",
-        parse_mode="Markdown",
-        reply_markup=confirm_kb,
+        "Yuqoridagi maʼlumotlar toʼgʼrimi?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Tasdiqlash", "❌ Bekor qilish"]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
     )
     return CONFIRM
 
-# ──────────────────────────────────────────────
-# TASDIQLASH
-# ──────────────────────────────────────────────
+
 async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
+    user = update.effective_user
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # DB ga saqlash
-    db_save(
-        user_id=update.effective_user.id,
-        name=d["name"],
-        phone=d["phone"],
-        grade=d["grade"],
-        course=d["course"],
-        branch=d["branch"],
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO registrations
+           (user_id, username, name, phone, grade, course, branch, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+        (user.id, user.username or "", d["name"], d["phone"],
+         d["grade"], d["course"], d["branch"], now, now)
+    )
+    reg_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "🎉 *Murojaatingiz muvaffaqiyatli qabul qilindi!*\n\n"
+        f"📍 *{d['branch']}* filialimiz xodimlari tez orada siz bilan bogʼlanishadi.\n\n"
+        "Savollar boʼлsa: @jony_academy\n"
+        "Koʼrishguncha! 👋",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-    # Sotuv menejerlar guruhiga yuborish
     if SALES_GROUP_ID:
-        try:
-            tg_user = update.effective_user
-            username = f"@{tg_user.username}" if tg_user.username else "username yo'q"
-            await context.bot.send_message(
-                chat_id=SALES_GROUP_ID,
-                text=(
-                    "🔔 *YANGI MUROJAAT — Jony Academy*\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *Ism:* {d['name']}\n"
-                    f"📱 *Telefon:* {d['phone']}\n"
-                    f"🎒 *Yosh/sinf:* {d['grade']}\n"
-                    f"📚 *Kurs:* {d['course']}\n"
-                    f"📍 *Filial:* {d['branch']}\n"
-                    f"💬 *Telegram:* {username}\n"
-                    f"🕐 *Vaqt:* {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-                    "━━━━━━━━━━━━━━━━━━━━"
-                ),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logging.error(f"Guruhga yuborishda xato: {e}")
+        uname = f"@{user.username}" if user.username else "—"
+        dt_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        msg = (
+            f"🔔 *YANGI MUROJAAT — Jony Academy*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 *Ism:* {d['name']}\n"
+            f"📱 *Telefon:* `{d['phone']}`\n"
+            f"🎒 *Yosh/sinf:* {d['grade']}\n"
+            f"📚 *Kurs:* {d['course']}\n"
+            f"📍 *Filial:* {d['branch']}\n"
+            f"💬 *Telegram:* {uname}\n"
+            f"🕐 *Vaqt:* {dt_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📞 Qoʼngʼiroq qilindi", callback_data=f"status:{reg_id}:called"),
+                InlineKeyboardButton("✅ Keldi",               callback_data=f"status:{reg_id}:came"),
+            ],
+            [InlineKeyboardButton("❌ Kelmadi", callback_data=f"status:{reg_id}:not_came")],
+        ])
+        sent = await context.bot.send_message(
+            chat_id=SALES_GROUP_ID, text=msg, parse_mode="Markdown", reply_markup=kb
+        )
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE registrations SET group_message_id=? WHERE id=?", (sent.message_id, reg_id))
+        conn.commit()
+        conn.close()
 
-    await update.message.reply_text(
-        "🎉 *Ro'yxatdan muvaffaqiyatli o'tdingiz!*\n\n"
-        "✅ Ma'lumotlaringiz qabul qilindi.\n"
-        "📞 Tez orada menejerimiz siz bilan bog'lanadi!\n\n"
-        "Savollar uchun: @jonyacademyadmin\n\n"
-        "_Jony Academy'ga qiziqganingiz uchun rahmat!_ 🙏",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
     context.user_data.clear()
     return ConversationHandler.END
 
-# ──────────────────────────────────────────────
-# BEKOR QILISH
-# ──────────────────────────────────────────────
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
     await update.message.reply_text(
-        "❌ Ro'yxatdan o'tish bekor qilindi.\n"
-        "Qayta boshlash uchun /start bosing.",
-        reply_markup=ReplyKeyboardRemove(),
+        "❌ Bekor qilindi.\n/start orqali qayta boshlashingiz mumkin.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─ Sotuv guruh: holat tugmalari ─────────────────────────────────────────────────────────────────────────
+
+async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.answer("Xato!")
+        return
+
+    _, reg_id_str, new_status = parts
+    reg_id = int(reg_id_str)
+
+    labels = {
+        "called":   "📞 Qoʼngʼiroq qilindi",
+        "came":     "✅ Keldi",
+        "not_came": "❌ Kelmadi",
+    }
+    label = labels.get(new_status, new_status)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE registrations SET status=?, updated_at=? WHERE id=?", (new_status, now, reg_id))
+    conn.commit()
+    c.execute("SELECT name FROM registrations WHERE id=?", (reg_id,))
+    row = c.fetchone()
+    conn.close()
+
+    await query.answer(f"✅ {label}")
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    manager = query.from_user.full_name
+    name = row[0] if row else "—"
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            f"🔄 *{name}* — {label}\n"
+            f"👤 {manager} · 🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        ),
+        parse_mode="Markdown",
+        reply_to_message_id=query.message.message_id
+    )
+
+
+# ─ Broadcast ─────────────────────────────────────────────────────────────────────────────
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_IDS:
+        await update.message.reply_text(
+            "⚠️ Broadcast ishlashi uchun Railway da "
+            "`ACADEMY_ADMIN_IDS` ni sozlang.\n"
+            "Telegram ID ni @userinfobot dan olishingiz mumkin.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Bu buyruq faqat adminlar uchun.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📢 *Broadcast rejimi*\n\n"
+        "Barcha roʼyxatdan oʼтgan foydalanuvchilarga "
+        "yuboriladigan xabarni yozing.\n\n"
+        "Bekor qilish: /cancel",
+        parse_mode="Markdown"
+    )
+    return BROADCAST_MSG
+
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    text = update.message.text
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT user_id FROM registrations WHERE user_id != 0")
+    user_ids = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    sent = failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📢 *Jony Academy:*\n\n{text}",
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ *Broadcast tugadi!*\n\n"
+        f"📨 Yuborildi: *{sent}*\n"
+        f"❌ Yuborilmadi: *{failed}*",
+        parse_mode="Markdown"
     )
     return ConversationHandler.END
 
-# ──────────────────────────────────────────────
-# ADMIN: /stat — statistika
-# ──────────────────────────────────────────────
+
+# ─ Admin buyruqlari ───────────────────────────────────────────────────────────────────────────
+
 async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = db_count()
-    rows = db_all()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM registrations")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT status, COUNT(*) FROM registrations GROUP BY status")
+    status_d = dict(cur.fetchall())
+    cur.execute("SELECT course, COUNT(*) FROM registrations GROUP BY course ORDER BY 2 DESC")
+    courses = cur.fetchall()
+    cur.execute("SELECT branch, COUNT(*) FROM registrations GROUP BY branch ORDER BY 2 DESC")
+    branches = cur.fetchall()
+    conn.close()
 
-    course_counts = {}
-    branch_counts = {}
-    for name, phone, grade, course, branch, created_at in rows:
-        course_counts[course] = course_counts.get(course, 0) + 1
-        branch_counts[branch] = branch_counts.get(branch, 0) + 1
-
-    kurs_lines   = "\n".join(f"  • {k}: {v} ta" for k, v in sorted(course_counts.items(), key=lambda x: -x[1]))
-    filial_lines = "\n".join(f"  • {k}: {v} ta" for k, v in sorted(branch_counts.items(), key=lambda x: -x[1]))
-    no_data      = "  — hali yo'q"
-
-    await update.message.reply_text(
-        f"📊 *Jony Academy — Statistika*\n"
+    msg = (
+        f"📊 *Statistika*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 *Jami murojaatlar:* {total} ta\n\n"
-        f"📚 *Kurslar bo'yicha:*\n{kurs_lines or no_data}\n\n"
-        f"📍 *Filiallar bo'yicha:*\n{filial_lines or no_data}",
-        parse_mode="Markdown",
+        f"Jami: *{total}*\n\n"
+        f"📈 *Holat:*\n"
+        f"  ⏳ Kutilmoqda: {status_d.get('pending', 0)}\n"
+        f"  📞 Qoʼngʼiroq: {status_d.get('called', 0)}\n"
+        f"  ✅ Keldi: {status_d.get('came', 0)}\n"
+        f"  ❌ Kelmadi: {status_d.get('not_came', 0)}\n\n"
+        f"📚 *Kurslar:*\n" +
+        "\n".join(f"  \u2022 {cn}: {n}" for cn, n in courses) +
+        "\n\n📍 *Filiallar:*\n" +
+        "\n".join(f"  \u2022 {bn}: {n}" for bn, n in branches)
     )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ──────────────────────────────────────────────
-# ADMIN: /royxat — ro'yxat Excel
-# ──────────────────────────────────────────────
+
 async def royxat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import csv, io
-    rows = db_all()
-    if not rows:
-        await update.message.reply_text("Hali murojaat yo'q.")
-        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, phone, grade, course, branch, status,
+               created_at, updated_at, username
+        FROM registrations ORDER BY id
+    """)
+    rows = cur.fetchall()
+    conn.close()
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Ism", "Telefon", "Yosh/Sinf", "Kurs", "Filial", "Vaqt"])
-    for row in rows:
-        writer.writerow(row)
-
+    writer.writerow([
+        "ID", "Ism", "Telefon", "Yosh/sinf", "Kurs", "Filial",
+        "Holat", "Roʼyxat vaqti", "Yangilangan", "Telegram"
+    ])
+    writer.writerows(rows)
     output.seek(0)
-    file_bytes = output.getvalue().encode("utf-8-sig")
-    file_like = io.BytesIO(file_bytes)
-    file_like.name = f"jony_academy_{datetime.datetime.now().strftime('%Y%m%d')}.csv"
 
+    fname = f"jony_academy_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     await update.message.reply_document(
-        document=file_like,
-        caption=f"📋 Jony Academy murojaatlar ro'yxati — {len(rows)} ta",
+        document=output.getvalue().encode("utf-8-sig"),
+        filename=fname,
+        caption=f"📋 Jami {len(rows)} ta murojaat"
     )
 
-# ──────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────
+
+# ─ Kunlik hisobot (job) ───────────────────────────────────────────────────────────────────────
+
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    if not SALES_GROUP_ID:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM registrations WHERE created_at LIKE ?", (f"{today}%",))
+    today_total = cur.fetchone()[0]
+    if today_total == 0:
+        conn.close()
+        return
+
+    cur.execute(
+        "SELECT status, COUNT(*) FROM registrations WHERE created_at LIKE ? GROUP BY status",
+        (f"{today}%",)
+    )
+    s = dict(cur.fetchall())
+
+    cur.execute(
+        "SELECT course, COUNT(*) FROM registrations "
+        "WHERE created_at LIKE ? GROUP BY course ORDER BY 2 DESC",
+        (f"{today}%",)
+    )
+    courses = cur.fetchall()
+
+    cur.execute(
+        "SELECT branch, COUNT(*) FROM registrations "
+        "WHERE created_at LIKE ? GROUP BY branch ORDER BY 2 DESC",
+        (f"{today}%",)
+    )
+    branches = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) FROM registrations")
+    grand_total = cur.fetchone()[0]
+    conn.close()
+
+    msg = (
+        f"📊 *KUNLIK HISOBOT — {datetime.now().strftime('%d.%m.%Y')}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Bugun: *{today_total}* ta murojaat\n\n"
+        f"*Holat:*\n"
+        f"  ⏳ Kutilmoqda: {s.get('pending', 0)}\n"
+        f"  📞 Qoʼngʼiroq qilindi: {s.get('called', 0)}\n"
+        f"  ✅ Keldi: {s.get('came', 0)}\n"
+        f"  ❌ Kelmadi: {s.get('not_came', 0)}\n\n"
+        f"*Kurslar:*\n" +
+        "\n".join(f"  \u2022 {cn}: {n}" for cn, n in courses) +
+        "\n\n*Filiallar:*\n" +
+        "\n".join(f"  \u2022 {bn}: {n}" for bn, n in branches) +
+        f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Jami barcha vaqt: *{grand_total}*"
+    )
+    await context.bot.send_message(
+        chat_id=SALES_GROUP_ID, text=msg, parse_mode="Markdown"
+    )
+
+
+# ─ Main ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    db_init()
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    conv = ConversationHandler(
+    reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
-            ],
-            PHONE: [
-                MessageHandler(filters.CONTACT, ask_grade),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_grade),
-            ],
-            CLASS_GRADE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_course),
-            ],
-            COURSE: [
-                CallbackQueryHandler(ask_branch, pattern="^course:"),
-            ],
-            BRANCH: [
-                CallbackQueryHandler(ask_confirm, pattern="^branch:"),
-            ],
+            NAME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            PHONE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_grade)],
+            CLASS_GRADE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_course)],
+            COURSE:      [CallbackQueryHandler(ask_branch, pattern=r"^course:")],
+            BRANCH:      [CallbackQueryHandler(ask_confirm, pattern=r"^branch:")],
             CONFIRM: [
                 MessageHandler(filters.Regex("^✅ Tasdiqlash$"), confirm_registration),
                 MessageHandler(filters.Regex("^❌ Bekor qilish$"), cancel),
             ],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("stat",   stat_command))
-    app.add_handler(CommandHandler("royxat", royxat_command))
+    broadcast_conv = ConversationHandler(
+        entry_points=[CommandHandler("broadcast", broadcast_start)],
+        states={
+            BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_send)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
-    logging.info("Jony Academy boti ishga tushdi...")
+    app.add_handler(broadcast_conv)
+    app.add_handler(reg_conv)
+    app.add_handler(CallbackQueryHandler(handle_status, pattern=r"^status:"))
+    app.add_handler(CommandHandler("stat",     stat_command))
+    app.add_handler(CommandHandler("royxat",   royxat_command))
+
+    app.job_queue.run_daily(
+        daily_report,
+        time=dt_time(20, 0, tzinfo=ZoneInfo("Asia/Tashkent"))
+    )
+
+    logger.info("Jony Academy bot ishga tushdi")
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
