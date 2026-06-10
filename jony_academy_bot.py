@@ -33,6 +33,21 @@ DB_PATH        = os.environ.get("ACADEMY_DB_PATH", "academy.db")
 KURSLAR   = ["Ingliz tili", "Rus tili", "Turk tili", "Nemis tili"]
 FILIALLAR = ["Zafar", "Bekobod Shahar", "Stretinko"]
 
+FILIAL_KONTAKT = {
+    "Zafar": {
+        "phones":    ["+998941326565", "+998931126565"],
+        "usernames": ["@Jonyacademyadmin", "@Jony_Academy_admin"],
+    },
+    "Bekobod Shahar": {
+        "phones":    ["+998772769777", "+998948697797"],
+        "usernames": ["@jonyAcademybekobod", "@Bekobod_Admin_2"],
+    },
+    "Stretinko": {
+        "phones":    ["+998773759777"],
+        "usernames": ["@Jony_Admin_Stretinka"],
+    },
+}
+
 NAME, PHONE, CLASS_GRADE, COURSE, BRANCH, CONFIRM = range(6)
 BROADCAST_MSG = 10  # alohida range — reg_conv bilan to'qnashmaydi
 
@@ -249,6 +264,18 @@ async def confirm_registration(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
+
+    # Filial kontakt ma'lumotlari
+    kontakt = FILIAL_KONTAKT.get(d["branch"])
+    if kontakt:
+        phones_str    = "\n".join(f"📞 <code>{p}</code>" for p in kontakt["phones"])
+        usernames_str = "\n".join(f"💬 {u}" for u in kontakt["usernames"])
+        await update.message.reply_text(
+            f"📍 <b>{html.escape(d['branch'])}</b> filiali admini bilan to'g'ridan-to'g'ri bog'lanish:\n\n"
+            f"{phones_str}\n{usernames_str}\n\n"
+            "Shoshilsangiz — hoziroq murojaat qilishingiz mumkin! 🚀",
+            parse_mode="HTML"
+        )
 
     # Sotuv guruhiga xabar + inline holat tugmalari
     if SALES_GROUP_ID:
